@@ -1,0 +1,26 @@
+{
+  "blender": "5.2.2 LTS",
+  "slm_count": 3,
+  "units": "metres",
+  "active_aperture_m": 0.0131,
+  "textures": "Illustrative, not trained or simulated",
+  "reflection_check": [
+    {
+      "device": 1,
+      "direction_error": 8.429369702178807e-08
+    },
+    {
+      "device": 2,
+      "direction_error": 8.429369702178807e-08
+    },
+    {
+      "device": 3,
+      "direction_error": 5.960464477539063e-08
+    },
+    {
+      "device": 4,
+      "direction_error": 0.0
+    }
+  ],
+  "objects": 164
+}

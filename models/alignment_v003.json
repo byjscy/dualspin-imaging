@@ -1,0 +1,78 @@
+[
+  {
+    "device": "02_Encoder",
+    "centre": [
+      -0.5299999713897705,
+      -0.44999998807907104,
+      0.30000001192092896
+    ],
+    "surface_shift_m": 0.011999987479292774,
+    "beam_endpoint_errors_m": [
+      [
+        "Incident / reflected path 1",
+        0.0
+      ],
+      [
+        "Incident / reflected path 2",
+        5.960464477539063e-08
+      ]
+    ]
+  },
+  {
+    "device": "03_SLM_A",
+    "centre": [
+      -0.5299999713897705,
+      0.3199999928474426,
+      0.30000001192092896
+    ],
+    "surface_shift_m": 0.011999982856022327,
+    "beam_endpoint_errors_m": [
+      [
+        "Incident / reflected path 2",
+        5.960464477539063e-08
+      ],
+      [
+        "Incident / reflected path 3",
+        2.9802322387695312e-08
+      ]
+    ]
+  },
+  {
+    "device": "04_SLM_B",
+    "centre": [
+      0.029999999329447746,
+      -0.17000000178813934,
+      0.30000001192092896
+    ],
+    "surface_shift_m": 0.012000000824476094,
+    "beam_endpoint_errors_m": [
+      [
+        "Incident / reflected path 3",
+        3.57802449023324e-08
+      ],
+      [
+        "Incident / reflected path 4",
+        6.055745559561573e-08
+      ]
+    ]
+  },
+  {
+    "device": "05_SLM_C",
+    "centre": [
+      0.550000011920929,
+      0.3400000035762787,
+      0.30000001192092896
+    ],
+    "surface_shift_m": 0.011999994111030062,
+    "beam_endpoint_errors_m": [
+      [
+        "Incident / reflected path 4",
+        4.2146848510894035e-08
+      ],
+      [
+        "Incident / reflected path 5",
+        4.2146848510894035e-08
+      ]
+    ]
+  }
+]

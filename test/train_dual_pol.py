@@ -1,0 +1,384 @@
+# -*- coding: utf-8 -*-
+"""Windows CUDA: two MNIST targets -> one phase code -> LCP/RCP images."""
+
+# ===================== 全局配置 =====================
+CONFIG = {
+    "mnist_dir": r"D:\Desktop\111",           # 直接读取原始 IDX.gz / IDX
+    "output_dir": r"D:\srdd\test",           # 每次运行创建日期时间子目录
+    "epochs": 5,                            # 训练总轮数
+    "wavelength_nm": 532.0,                  # 绿色激光波长，单位 nm
+    "batch_size": 12,                         # 显存不足时改为 4 或 2
+    "learning_rate": 0.001,
+    "seed": 42,
+    "device": "cuda:0",                      # 使用已验证的 DP 环境
+    "encoder_bf16": True,                    # 仅编码器用 BF16；光场为 complex64
+    "train_limit": 0,                        # 0 = 使用完整的训练划分
+    "val_size": 5000,                        # 从官方训练集划出，其余用于训练
+    "test_limit": 0,                         # 0 = 使用官方 10,000 张测试图
+    "target_size": 96,
+    "code_size": 24,
+    "slm_size": 200,
+    "padding": 100,                          # 计算网格 = slm_size + 2 * padding
+    "pixel_pitch_um": 8.0,                   # 参考代码的模拟采样间隔，单位 μm
+    "retardance_rad": 0.6283185307179586,     # π/5，等效模型参考值
+    "active_layers": [1, 2, 3],               # 单层对照可设为 [2]，须单独重训
+    # 编码面至第 1 层、层 1 至层 2、层 2 至层 3、层 3 至探测面。
+    # 每段可含多个 (传播距离 m, 折射率)，数值沿用参考 txt。
+    "paths": [ [[0.05, 1.0], [0.001, 1.46]], [[0.002, 1.46]],
+               [[0.002, 1.46]], [[0.001, 1.46], [0.05, 1.0]] ],
+    "band_limit": True,
+    "target_roi_power_per_channel": 0.05,    # 每路相对于单位入射功率
+    "edge_loss_weight": 0.05,
+    "blank_channel_probability": 0.10,       # 部分训练对只保留一个目标，优化隔离度
+    "save_examples": 24,
+    "isolation_test_images": 256,
+    "log_every_batches": 150,
+}
+# =============================================================
+
+import argparse
+import gzip
+import json
+import math
+import struct
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from export_results import export_results, format_elapsed, write_csv, write_json
+
+
+MODEL_KEYS = ("target_size", "code_size", "slm_size", "padding", "pixel_pitch_um",
+              "wavelength_nm", "retardance_rad", "active_layers", "paths", "band_limit")
+
+
+def validate(c):
+    h, code, slm = (c[key] for key in ("target_size", "code_size", "slm_size"))
+    if h < 32 or code < 1 or h % 4 or h % code or slm < h or (slm - h) % 2:
+        raise ValueError("目标尺寸须为 4 和编码尺寸的整数倍，并能居中放入调制网格。")
+    for key in ("epochs", "batch_size", "val_size", "log_every_batches"):
+        if c[key] < 1:
+            raise ValueError(f"{key} 必须为正整数。")
+    for key in ("padding", "train_limit", "test_limit", "isolation_test_images", "save_examples", "edge_loss_weight"):
+        if c[key] < 0:
+            raise ValueError(f"{key} 不能为负。")
+    for key in ("wavelength_nm", "pixel_pitch_um", "learning_rate"):
+        if not c[key] > 0:
+            raise ValueError(f"{key} 必须为正数。")
+    if not 0 < c["target_roi_power_per_channel"] <= 0.5 or not 0 <= c["blank_channel_probability"] < 1:
+        raise ValueError("请检查目标功率或空通道概率。")
+    layers = c["active_layers"]
+    if not layers or layers != sorted(set(layers)) or not set(layers) <= {1, 2, 3}:
+        raise ValueError("active_layers 需要按升序选择 1、2、3 中的调制面。")
+    if len(c["paths"]) != 4 or any(not path for path in c["paths"]):
+        raise ValueError("必须设置四段传播路径。")
+    if any(z < 0 or n <= 0 for path in c["paths"] for z, n in path):
+        raise ValueError("传播距离必须非负，折射率必须为正。")
+
+
+def read_mnist(directory, split, device):
+    root = Path(directory)
+
+    def read(name):
+        for folder in (root, root / "raw", root / "MNIST" / "raw"):
+            packed = folder / (name + ".gz")
+            if packed.is_file():
+                return gzip.decompress(packed.read_bytes())
+            plain = folder / name
+            if plain.is_file():
+                return plain.read_bytes()
+        raise FileNotFoundError(f"{root} 缺少 {name} 或 {name}.gz。")
+
+    pixels = read(f"{split}-images-idx3-ubyte")
+    labels = read(f"{split}-labels-idx1-ubyte")
+    expected = {"train": 60000, "t10k": 10000}[split]
+    if len(pixels) != 16 + expected * 784 or struct.unpack_from(">IIII", pixels) != (2051, expected, 28, 28):
+        raise ValueError(f"{split} 图像 IDX 文件长度或文件头异常。")
+    if len(labels) != 8 + expected or struct.unpack_from(">II", labels) != (2049, expected) or max(labels[8:]) > 9:
+        raise ValueError(f"{split} 标签 IDX 文件异常。")
+    images = np.frombuffer(pixels, dtype=np.uint8, offset=16).copy().reshape(expected, 28, 28)
+    classes = np.frombuffer(labels, dtype=np.uint8, offset=8).copy()
+    # 一次上传 uint8 图像库。全量训练和测试图像共约 52 MiB。
+    return torch.from_numpy(images).to(device), classes
+
+
+def paired_indices(indices, seed):
+    """Each digit appears once in each channel, with no identical sample pair."""
+    if len(indices) < 2:
+        raise ValueError("每个划分至少需要两张图。")
+    order = np.random.default_rng(seed).permutation(indices)
+    return np.column_stack((order, np.roll(order, 1)))
+
+
+def image_batches(images, pairs, batch_size, output_size):
+    indices = torch.as_tensor(pairs, device=images.device)
+    for batch in indices.split(batch_size):
+        x = images[batch].to(torch.float32).mul_(1 / 255)
+        yield F.interpolate(x, size=(output_size, output_size), mode="bilinear", align_corners=False)
+
+
+class OpticalDecoder(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.s = c["slm_size"]
+        self.pad = c["padding"]
+        self.grid = self.s + 2 * self.pad
+        self.size = c["target_size"]
+        self.offset = (self.grid - self.size) // 2
+        self.active = tuple(k - 1 for k in c["active_layers"])
+        self.beta = nn.ParameterDict({str(k): nn.Parameter(0.1 * torch.randn(self.s, self.s)) for k in self.active})
+        self.c = math.cos(c["retardance_rad"] / 2)
+        self.sine = math.sin(c["retardance_rad"] / 2)
+        self.register_buffer("transfer", self.transfer_kernels(c), persistent=False)
+
+    def transfer_kernels(self, c):
+        pitch, wavelength = c["pixel_pitch_um"] * 1e-6, c["wavelength_nm"] * 1e-9
+        freq = torch.fft.fftfreq(self.grid, d=pitch, dtype=torch.float64)
+        fy, fx = torch.meshgrid(freq, freq, indexing="ij")
+        transverse = (wavelength * fx).square() + (wavelength * fy).square()
+        kernels = []
+        for segments in c["paths"]:
+            phase = torch.zeros_like(transverse)
+            shift = torch.zeros_like(transverse)
+            valid = torch.ones_like(transverse, dtype=torch.bool)
+            for distance, index in segments:
+                q = index**2 - transverse
+                kz = q.clamp_min(0).sqrt()
+                # sqrt(n²-s)-n = -s/(sqrt(n²-s)+n)，省去不影响光强的全局载波。
+                phase -= (2 * math.pi * distance / wavelength) * transverse / (kz + index)
+                shift += distance * wavelength / kz.clamp_min(1e-15)
+                valid &= q > 0
+            if c["band_limit"]:
+                half_window = self.grid * pitch / 2
+                valid &= ((shift * fx).abs() <= half_window) & ((shift * fy).abs() <= half_window)
+            kernels.append((torch.exp(1j * phase) * valid).to(torch.complex64))
+        return torch.stack(kernels)
+
+    def propagate(self, field, segment):
+        return torch.fft.ifft2(torch.fft.fft2(field) * self.transfer[segment])
+
+    def forward(self, code, measure_power=False):
+        # 用一份相位图照明，入口为单位功率的纯 LCP。第一次 FFT 仅计算标量场。
+        fine = F.interpolate(code, size=(self.size, self.size), mode="nearest")[:, 0]
+        incident = F.pad(torch.exp(1j * fine) / self.size, (self.offset,) * 4)
+        left = self.propagate(incident, 0)
+        field = torch.stack((left, torch.zeros_like(left)), dim=1)
+        aperture = slice(self.pad, self.pad + self.s)
+        for k in range(3):
+            if k in self.active:
+                left, right = field[..., aperture, aperture].unbind(1)
+                phase = torch.exp(1j * self.beta[str(k)])
+                # [L,R] 与参考 txt 一致：R->L 使用 +β，L->R 使用 −β。
+                left_out = self.c * left - 1j * self.sine * phase * right
+                right_out = self.c * right - 1j * self.sine * phase.conj() * left
+                field = F.pad(torch.stack((left_out, right_out), dim=1), (self.pad,) * 4)
+            field = self.propagate(field, k + 1)
+        roi = slice(self.offset, self.offset + self.size)
+        intensity = field[..., roi, roi].abs().square()
+        full_power = field.abs().square().sum(dim=(-2, -1)) if measure_power else None
+        return intensity, full_power
+
+
+class ImagingModel(nn.Module):
+    def __init__(self, c, amp):
+        super().__init__()
+        self.optics = OpticalDecoder(c)
+        self.code_size = c["code_size"]
+        self.amp = amp
+        self.encoder = nn.Sequential(
+            nn.Conv2d(2, 24, 4, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(24, 48, 4, stride=2, padding=1), nn.GELU(),
+            nn.Conv2d(48, 48, 3, padding=1), nn.GELU(),
+            nn.Conv2d(48, 1, 3, padding=1),
+        )
+
+    def forward(self, x, measure_power=False):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.amp):
+            logits = self.encoder(x.contiguous(memory_format=torch.channels_last))
+        logits = logits.float()
+        if logits.shape[-1] != self.code_size:
+            logits = F.adaptive_avg_pool2d(logits, (self.code_size, self.code_size))
+        code = (2 * math.pi) * logits.sigmoid()
+        image, power = self.optics(code, measure_power)
+        return image, code[:, 0], power
+
+
+def target_intensity(x, c):
+    return x * (c["target_roi_power_per_channel"] / x.sum((-2, -1), keepdim=True).clamp_min(1e-8))
+
+
+def image_loss(y, target, c):
+    error = (y - target) * (c["target_size"]**2 / (2 * c["target_roi_power_per_channel"]))
+    mse = error.square().mean()
+    edge_x = error.diff(dim=-1).abs().mean()
+    edge_y = error.diff(dim=-2).abs().mean()
+    return mse + c["edge_loss_weight"] * (edge_x + edge_y)
+
+
+def epoch_loss(model, images, pairs, c, epoch, run_started, epoch_started, optimizer=None):
+    training = optimizer is not None
+    model.train(training)
+    total = torch.zeros((), device=images.device)
+    batch_count = math.ceil(len(pairs) / c["batch_size"])
+    rng = torch.Generator(device=images.device).manual_seed(c["seed"] + 3_000_000 + epoch)
+    with torch.set_grad_enabled(training):
+        for batch, x in enumerate(image_batches(images, pairs, c["batch_size"], c["target_size"]), 1):
+            if training and c["blank_channel_probability"]:
+                half = c["blank_channel_probability"] / 2
+                draw = torch.rand(len(x), device=x.device, generator=rng)
+                keep = torch.stack((draw >= half, (draw < half) | (draw >= 2 * half)), dim=1)
+                x = x * keep[..., None, None]
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            y, _, _ = model(x)
+            loss = image_loss(y, target_intensity(x, c), c)
+            if training:
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            total += loss.detach() * len(x)
+            if training and (batch % c["log_every_batches"] == 0 or batch == batch_count):
+                current_loss = loss.item()  # 等待该批次的 CUDA 计算，再读时间。
+                now = time.perf_counter()
+                print(f"epoch {epoch:03d}/{c['epochs']:03d} | batch {batch:05d}/{batch_count:05d} | "
+                      f"loss {current_loss:.5f} | 本轮 {format_elapsed(now - epoch_started)} | "
+                      f"累计 {format_elapsed(now - run_started)}", flush=True)
+    value = total.item() / len(pairs)
+    if not math.isfinite(value):
+        raise FloatingPointError("发现非有限损失，请降低学习率或关闭 encoder_bf16 后检查。")
+    return value
+
+
+def save_checkpoint(state, path):
+    pending = path.with_suffix(".tmp")
+    torch.save(state, pending)
+    pending.replace(path)
+
+
+def main():
+    run_started = time.perf_counter()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--smoke", action="store_true", help="128 训练 / 32 验证 / 48 测试，运行 1 轮")
+    parser.add_argument("--config", type=Path, help="可选 JSON 文件覆盖 CONFIG 中的同名参数")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--resume", type=Path, help="从本程序的 last.pt 继续训练至配置中的总轮数")
+    mode.add_argument("--test-only", type=Path, help="用本程序的 best.pt 或 last.pt 中的验证最优权重重新测试")
+    args = parser.parse_args()
+    c = dict(CONFIG)
+    if args.config:
+        updates = json.loads(args.config.read_text(encoding="utf-8-sig"))
+        if not isinstance(updates, dict) or updates.keys() - c.keys():
+            raise ValueError("配置文件必须为 JSON 对象，且只能覆盖 CONFIG 中已有的键。")
+        c.update(updates)
+    if args.smoke:
+        if args.resume or args.test_only:
+            parser.error("--smoke 只用于全新短程试跑。")
+        c.update(epochs=1, train_limit=128, val_size=32, test_limit=48,
+                 save_examples=4, isolation_test_images=16)
+    validate(c)
+    device = torch.device(c["device"])
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("请用已有的 DP 环境运行。该程序需要可用的 NVIDIA CUDA。")
+    torch.cuda.set_device(device)
+    torch.manual_seed(c["seed"])
+    torch.set_float32_matmul_precision("high")
+    amp = c["encoder_bf16"] and torch.cuda.is_bf16_supported()
+    model = ImagingModel(c, amp).to(device)
+    model.encoder.to(memory_format=torch.channels_last)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=c["learning_rate"], fused=True, weight_decay=0.0)
+
+    history, start, best = [], 0, None
+    smoke_origin = args.smoke
+    checkpoint_path = args.resume or args.test_only
+    if checkpoint_path:
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        smoke_origin = bool(state.get("smoke", checkpoint_path.parent.name.endswith("_smoke")))
+        locked = MODEL_KEYS + ("target_roi_power_per_channel",)
+        if args.resume:
+            locked += ("seed", "train_limit", "val_size", "blank_channel_probability", "edge_loss_weight")
+        for key in locked:
+            if state["config"][key] != c[key]:
+                raise ValueError(f"配置 {key} 与检查点不一致。")
+        best = state["best"]
+        if args.resume:
+            if "optimizer" not in state:
+                raise ValueError("续训需要 last.pt。")
+            history, start = state["history"], state["epoch"]
+            for row in history:
+                row.setdefault("peak_allocated_mib", None)
+                row.setdefault("run_elapsed_seconds", None)
+            if c["epochs"] <= start:
+                raise ValueError(f"续训时 epochs 必须大于已完成的 {start}。")
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            for group in optimizer.param_groups:
+                group["lr"] = c["learning_rate"]
+
+    tag = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+    output = Path(c["output_dir"]).resolve() / f"{tag}{'_smoke' if smoke_origin else ''}"
+    output.mkdir(parents=True)
+    write_json(output / "config.json", c)
+    environment = {"gpu": torch.cuda.get_device_name(device), "cuda_runtime": torch.version.cuda,
+                   "pytorch": str(torch.__version__), "encoder_bf16": amp,
+                   "fft_grid": model.optics.grid, "smoke": smoke_origin}
+    write_json(output / "environment.json", environment)
+    print(f"{environment['gpu']} | CUDA {torch.version.cuda} | {c['wavelength_nm']:g} nm | {output}", flush=True)
+    training_seconds = 0.0
+    if not args.test_only:
+        training_started = time.perf_counter()
+        train_images, _ = read_mnist(c["mnist_dir"], "train", device)
+        order = np.random.default_rng(c["seed"]).permutation(len(train_images))
+        val_indices, train_indices = order[:c["val_size"]], order[c["val_size"]:]
+        if c["train_limit"]:
+            train_indices = train_indices[:c["train_limit"]]
+        val_pairs = paired_indices(val_indices, c["seed"] + 1_000_000)
+        np.savez(output / "split_indices.npz", train=train_indices, val=val_indices, val_pairs=val_pairs)
+        for epoch in range(start + 1, c["epochs"] + 1):
+            begin = time.perf_counter()
+            torch.cuda.reset_peak_memory_stats(device)
+            train_pairs = paired_indices(train_indices, c["seed"] + epoch)
+            train_error = epoch_loss(model, train_images, train_pairs, c, epoch, run_started, begin, optimizer)
+            val_error = epoch_loss(model, train_images, val_pairs, c, epoch, run_started, begin)
+            now = time.perf_counter()
+            seconds = now - begin
+            history.append({"epoch": epoch, "train_loss": train_error, "val_loss": val_error, "seconds": seconds,
+                            "peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20,
+                            "run_elapsed_seconds": now - run_started})
+            improved = best is None or val_error < best["val_loss"]
+            if improved:
+                best = {"epoch": epoch, "val_loss": val_error,
+                        "model": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}}
+            last = {"epoch": epoch, "config": c, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "history": history, "best": best, "smoke": smoke_origin}
+            save_checkpoint(last, output / "last.pt")
+            write_csv(output / "history.csv", history)
+            print(f"epoch {epoch:03d}/{c['epochs']:03d} 完成 | train {train_error:.5f} | val {val_error:.5f} | "
+                  f"本轮 {format_elapsed(seconds)} | 累计 {format_elapsed(now - run_started)}", flush=True)
+        save_checkpoint({"best": best, "config": c, "smoke": smoke_origin}, output / "best.pt")
+        del train_images
+        training_seconds = time.perf_counter() - training_started
+
+    model.load_state_dict(best["model"])
+    model.eval()
+    test_images, labels = read_mnist(c["mnist_dir"], "t10k", device)
+    # 限量测试采用固定随机子集，完整测试使用全部官方测试集。
+    subset = np.random.default_rng(c["seed"] + 2_000_000).permutation(len(test_images))
+    if c["test_limit"]:
+        subset = subset[:c["test_limit"]]
+    test_pairs = paired_indices(subset, c["seed"] + 2_000_001)
+    batches = image_batches(test_images, test_pairs, c["batch_size"], c["target_size"])
+    timing = export_results(output, model, batches, test_pairs, labels, target_intensity, c, best, environment,
+                            source_checkpoint=str(checkpoint_path) if args.test_only else "best.pt",
+                            run_started=run_started, training_seconds=training_seconds)
+    print(f"总用时 {format_elapsed(timing['total_seconds'])} | "
+          f"训练与验证 {format_elapsed(timing['training_seconds'])}", flush=True)
+    print(f"结果已保存到 {output}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+{
+  "backend": "OPTIX",
+  "devices": [
+    {
+      "name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "type": "OPTIX",
+      "enabled": true
+    },
+    {
+      "name": "13th Gen Intel Core i9-13900H",
+      "type": "CPU",
+      "enabled": false
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+      "type": "CUDA",
+      "enabled": false
+    }
+  ],
+  "scenes": [
+    {
+      "name": "Scene",
+      "render_device": "GPU",
+      "denoiser": "OPTIX",
+      "preview_denoiser": "OPTIX"
+    }
+  ]
+}

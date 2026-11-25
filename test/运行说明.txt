@@ -1,0 +1,41 @@
+双通道偏振成像 CUDA 程序
+
+打开 train_dual_pol.py，在文件前面的 CONFIG 修改 epochs（总轮数）、wavelength_nm（激光波长）、mnist_dir（四个 MNIST 文件的目录）、output_dir（输出目录）及 batch_size。默认值为 80 轮、532 nm、D:\Desktop\111、D:\srdd\test、每批 8 对。程序直接读取 .gz 文件。
+
+在 PowerShell 进入 D:\srdd\test 后运行：
+
+  .\run_cuda.cmd --smoke    试跑 1 轮，用 128 对训练、32 对验证、48 对测试。
+  .\run_cuda.cmd            按 CONFIG 正式训练、测试和导出。
+
+启动脚本调用 C:\Users\siyuan\miniconda3\envs\DP\python.exe。也可以在 PyCharm 给该项目选择这个解释器，再运行 train_dual_pol.py。DP 已包含 PyTorch、NumPy 和 Pillow。
+
+正式配置从 MNIST 官方训练集划出固定的 5,000 张验证图，用余下 55,000 张训练。在验证集选取最优权重后，用官方 10,000 张测试图评估。每个划分中的每张图在两路各出现一次，配对内两张图的索引不同。训练每轮重新配对。部分训练对只保留一个通道目标，用于学习隔离。
+
+运行结束后在 output_dir 下查看日期时间子目录。带 _smoke 的目录是短程测试，适合查流程和输出格式。
+
+训练每隔 log_every_batches 批和每轮最后一批显示 当前轮/总轮数、当前批/总批数、损失、本轮已用时间和本次运行累计时间。每轮结束的本轮用时包含验证。结束时显示本次总用时，包含数据准备、训练、测试和导出。续训时用时从本次启动计算。
+
+  result_report.txt        中文运行结论和总用时
+  config.json              重现实验所用的配置
+  environment.json         显卡、CUDA、PyTorch 和光学计算网格
+  split_indices.npz        训练、验证样本索引和验证配对
+  history.csv              训练/验证损失、每轮与累计时间、CUDA 峰值分配显存
+  best.pt、last.pt         验证最优模型和可续训检查点
+  test_metrics.csv         每对测试图的索引、标签、分通道 PSNR/SSIM、低分辨基线和功率
+  test_summary.json        分通道均值、标准差、隔离测试汇总和运行计时
+  examples                 同一对的两个目标、共享相位码、两路输出、24×24 基线和原始数组
+  layer_phases             每个有效调制层的相位预览及弧度数组
+  crosstalk.csv            (A,0) 与 (0,B) 对照，对应两路探测功率和泄漏比
+  line_pairs               横纵线对的目标、基线、输出、强度剖面和对比度
+
+续训时把 CONFIG 的 epochs 改为新的总轮数，再运行：
+
+  .\run_cuda.cmd --resume "D:\srdd\test\某次运行\last.pt"
+
+仅测试时可以使用 best.pt 或 last.pt，都会取验证最优状态：
+
+  .\run_cuda.cmd --test-only "D:\srdd\test\某次运行\best.pt"
+
+也可通过 --config <JSON路径> 临时覆盖 CONFIG 中已有的键。续训需要与原运行相同的模型、数据划分及损失设定。做单层对照时另开一次训练，将 active_layers 设为 [2]，保留相同传播距离和数据划分。
+
+程序沿用参考 txt 的圆偏振 Jones 耦合符号和模拟传播参数。编码器才使用 BF16，复数光场使用 complex64。三层相位是等效耦合相位，实际器件驱动需要做标定。96×96 是输出采样网格，物理分辨率需用独立线对和实测尺度验证。

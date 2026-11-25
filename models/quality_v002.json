@@ -1,0 +1,22 @@
+{
+  "overview": [
+    3840,
+    2880
+  ],
+  "layout": [
+    3840,
+    2880
+  ],
+  "detail": [
+    2560,
+    2560
+  ],
+  "samples": 128,
+  "denoising": true,
+  "device": "GPU",
+  "devices": [
+    "NVIDIA GeForce RTX 4060 Laptop GPU",
+    "NVIDIA GeForce RTX 4060 Laptop GPU"
+  ],
+  "interactive_file": "optical_system_v002.blend"
+}

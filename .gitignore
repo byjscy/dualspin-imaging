@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv_*/
+.idea/
+.env
+.env.*
+*.blend1
+/test/[0-9]*/
+/test/tmp_*/
+/output/pdf/
+/report_build/
+/make_homework_pdf.py
+/optix7cache.db
+/pdf_review-*.png
+/wechat_article.html

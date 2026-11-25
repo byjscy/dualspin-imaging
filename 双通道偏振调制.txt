@@ -1,0 +1,985 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Mar 29 19:59:59 2026
+
+@author: admin
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Apr 20 16:40:12 2019
+
+@author: ad
+"""
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, transforms
+import numpy as np
+import torch
+import torch.nn as nn
+import seaborn as sns
+import torch.nn.functional as F
+from torchvision.transforms import functional as TF
+#import cv2
+import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
+from PIL import Image
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, transforms
+import numpy as np
+import os
+from matplotlib import patches
+import pathlib
+from time import time
+from scipy.io import loadmat, savemat
+import torchvision.transforms as transforms
+from torchvision.datasets import ImageFolder
+from torch.utils.data import Dataset, DataLoader
+import os
+import cv2
+from sklearn.metrics import confusion_matrix, accuracy_score
+# %matplotlib widget
+import random
+import torchvision.utils as vutils
+from scipy.ndimage import gaussian_filter
+import torchvision.models as models
+from torch.utils.data import DataLoader, Dataset, Subset, SubsetRandomSampler
+
+#os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+# 全局变量
+
+
+
+# 检测可用设备
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {device}")
+
+wave_length = 532e-9  # 波长（单位：m）
+dd = 0.001
+distance = (dd, dd, dd, dd, dd, 0.05)  # 层间距（单位：m）
+neuron = 8e-6  # 神经元大小（单位：m）
+sampling_point = 200  # 单边神经元数目
+side_length = neuron * sampling_point  # 相位调制层边长（单位：m）
+MODE = 'test'
+window_expand = 50  # fft窗口扩大
+region_size = 10
+gamma=1 * np.pi / 5
+
+threshold_VALUE = 128
+from datetime import datetime
+start_time = datetime.now()
+#%%
+
+class MyDataset(Dataset):
+    def __init__(self, img_dir, label_file, num_classes=10, transform = None):
+        self.img_names = os.listdir(img_dir)
+        self.img_paths = [os.path.join(img_dir, name) for name in self.img_names]
+        self.labels = {}
+        self.transform = transform
+        with open(label_file, 'r') as f:
+            for line in f:
+                img_name, label = line.strip().split()
+                self.labels[img_name] = int(label)
+        self.num_classes = num_classes
+      
+    def __getitem__(self, idx):
+        img_name = self.img_names[idx]
+        img_path = self.img_paths[idx]
+        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        img = cv2.resize(img, (150, 150), interpolation = cv2.INTER_LINEAR)
+        img = cv2.copyMakeBorder(img, 25, 25, 25, 25, cv2.BORDER_CONSTANT, value = 0)
+        label = self.labels[img_name]
+        label_one_hot = np.zeros(self.num_classes, dtype=np.float32)
+        label_one_hot[label] = 1.0
+        
+        #img = transform(img)
+        #img = normalize(img)
+       # img = img.astype(np.float32)
+        img = img.astype(np.float32) / 255.0   # 归一化到 [0,1]
+
+        img = np.expand_dims(img, axis=0)
+        img_tensor = torch.from_numpy(img)
+        label_tensor = torch.from_numpy(label_one_hot)
+        return img_tensor, label_tensor
+
+    def __len__(self):
+        return len(self.img_names)
+
+#%%
+
+
+# 设置图像和标签文件所在的路径
+img_dir = r"D:\gongwei\dataset\images\train"
+label_file = r"D:\gongwei\dataset\labels\train_labels.txt"
+
+# 创建数据集对象
+dataset = MyDataset(img_dir, label_file)
+subset = Subset(dataset, list(range(300)))
+# 创建数据加载器对象
+dataloader = DataLoader(subset, batch_size =300, shuffle=True)
+
+# =============================================================================
+# test_img_dir = r"D:\gongwei\dataset\images\test"
+# test_label_file = r"D:\gongwei\dataset\labels\test_labels.txt"
+# # 随机生成1000个样本索引
+# num_test_samples = 10000
+# test_dataset = MyDataset(test_img_dir, test_label_file)
+# test_dataloader = DataLoader(test_dataset, batch_size=500)
+# =============================================================================
+img_dir = r"D:\gongwei\dataset\images\train"
+label_file = r"D:\gongwei\dataset\labels\train_labels.txt"
+
+# 创建数据集对象
+dataset = MyDataset(img_dir, label_file)
+subset = Subset(dataset, list(range(200)))
+# 创建数据加载器对象
+test_dataloader = DataLoader(subset, batch_size =55, shuffle=False)
+
+
+#%%光学部分
+# 定义函数将数据集的矩阵元素转换为光场振幅
+def pixel2amplitude(X):
+    X = torch.sqrt(X)
+    return X
+
+# 自定义预处理层
+class pre_process(torch.nn.Module):
+    """自定义预处理层。"""
+    def __init__(self):
+        super(pre_process, self).__init__()
+
+    def forward(self, X):
+        # X = X / 255
+        # X = pixel2amplitude(X)
+        
+        X = X * (2 * np.pi) #相位取值为0~2pi
+        X = torch.exp(1j * X)
+        X = torch.nn.functional.pad(X, (window_expand, window_expand, window_expand, window_expand), "constant", 0)
+        return X
+
+# 衍射传输层
+class DiffractionTransmission(torch.nn.Module):
+    """衍射传输层，用于计算光场的衍射传输过程."""
+    def __init__(self, D):
+        super(DiffractionTransmission, self).__init__()
+        self.D = D
+        FreqPoint1 = torch.linspace(-1/(2 * neuron), 1/(2 * neuron), sampling_point + 2 * window_expand, device=device)
+        FreqPoint2 = torch.linspace(-1/(2 * neuron), 1/(2 * neuron), sampling_point + 2 * window_expand, device=device)
+        self.fu, self.fv = torch.meshgrid(FreqPoint1, FreqPoint2, indexing='ij')
+
+    def sqrt(self, X):
+        """自定义开方函数"""
+        y = torch.where(X < 0, torch.zeros_like(X), torch.sqrt(X))
+        return y
+
+    def forward(self, X):
+        dif = (2 * np.pi / wave_length) * self.sqrt(2.1316 - torch.square(wave_length * self.fu) - torch.square(wave_length * self.fv))
+        angular_spectrum = torch.fft.fftshift(torch.fft.fft2(X)) * torch.where(torch.square(wave_length * self.fu) + torch.square(wave_length * self.fv) < 2.1316, 1, 0) * torch.exp(1j * dif * self.D)
+        X = torch.fft.ifft2(torch.fft.ifftshift(angular_spectrum))
+        return X
+class DiffractionTransmission1(torch.nn.Module):
+    """衍射传输层，用于计算光场的衍射传输过程."""
+    def __init__(self, D):
+        super(DiffractionTransmission1, self).__init__()
+        self.D = D
+        FreqPoint1 = torch.linspace(-1/(2 * neuron), 1/(2 * neuron), sampling_point + 2 * window_expand, device=device )
+        FreqPoint2 = torch.linspace(-1/(2 * neuron), 1/(2 * neuron), sampling_point + 2 * window_expand, device=device )
+        self.fu, self.fv = torch.meshgrid(FreqPoint1, FreqPoint2, indexing='ij')
+
+    def sqrt(self, X):
+        """自定义开方函数"""
+        y = torch.where(X < 0, torch.zeros_like(X), torch.sqrt(X))
+        return y
+
+    def forward(self, X):
+        dif = (2 * np.pi / wave_length) * self.sqrt(1 - torch.square(wave_length * self.fu) - torch.square(wave_length * self.fv))
+        angular_spectrum = torch.fft.fftshift(torch.fft.fft2(X)) * torch.where(torch.square(wave_length * self.fu) + torch.square(wave_length * self.fv) < 1, 1, 0) * torch.exp(1j * dif * self.D)
+        X = torch.fft.ifft2(torch.fft.ifftshift(angular_spectrum))
+        return X
+def param2phase(param):
+    """将参数映射到相位值"""
+    phase = torch.sigmoid(param) * (2 * np.pi)
+    return phase
+
+class modulate_a(torch.nn.Module):
+    """光场相位调制层"""
+    def __init__(self):
+        super(modulate_a, self).__init__()
+        self.M = torch.nn.Parameter(torch.zeros(sampling_point, sampling_point))  # 创建参数张量
+# =============================================================================
+#         with torch.no_grad():
+#             # 生成固定噪声矩阵（标准差5，最大约±15）
+#             self.gamma_noise = torch.randn(
+#                 sampling_point, sampling_point,
+#                 device=device
+#             ) * 5
+# =============================================================================
+    def forward(self, X, polarization):
+        """
+        X: 入射光场
+        polarization: 'RCP' 或 'LCP'，表示左右旋偏振光
+        """
+# =============================================================================
+#         gamma_noisy = gamma + self.gamma_noise
+#         # 将gamma矩阵扩展到与填充后相同的尺寸
+#         padded_gamma = torch.nn.functional.pad(
+#             gamma_noisy,
+#             (window_expand, window_expand, window_expand, window_expand),
+#             "constant",
+#             0
+#         )
+# =============================================================================
+        g = torch.tensor(gamma / 2.0, dtype=torch.float32)
+        if polarization == 'LCP':
+            term1 = X * torch.cos(g)
+            term2 = -1j * X * torch.sin(g) * torch.exp(-1j * torch.nn.functional.pad(param2phase(self.M), (window_expand, window_expand, window_expand, window_expand), "constant", 0))
+        elif polarization == 'RCP':
+            term1 = -1j * X * torch.sin(g) * torch.exp(1j * torch.nn.functional.pad(param2phase(self.M), (window_expand, window_expand, window_expand, window_expand), "constant", 0))
+            term2 = X * torch.cos(g)
+
+        return term1, term2  # 分别返回左右旋光的电场
+class modulate_b(torch.nn.Module):
+    """光场相位调制层"""
+    def __init__(self):
+        super(modulate_b, self).__init__()
+        self.M = torch.nn.Parameter(torch.zeros(sampling_point, sampling_point))  # 创建参数张量
+# =============================================================================
+#         with torch.no_grad():
+#             # 生成固定噪声矩阵（标准差5，最大约±15）
+#             self.gamma_noise = torch.randn(
+#                 sampling_point, sampling_point,
+#                 device=device
+#             ) * 5
+# =============================================================================
+    def forward(self, X_LCP, X_RCP):
+        """
+        X_LCP: 左旋圆偏振光
+        X_RCP: 右旋圆偏振光
+        """
+# =============================================================================
+#         gamma_noisy = gamma + self.gamma_noise
+# 
+#         # 将gamma矩阵扩展到与填充后相同的尺寸
+#         padded_gamma = torch.nn.functional.pad(
+#             gamma_noisy,
+#             (window_expand, window_expand, window_expand, window_expand),
+#             "constant",
+#             0
+#         )
+# =============================================================================
+        g = torch.tensor(gamma / 2.0, dtype=torch.float32)
+        # 对左旋圆偏振光（LCP）进行调制
+        term1_LCP = X_LCP * torch.cos(g)
+        term2_LCP = -1j * X_LCP * torch.sin(g) * torch.exp(-1j * torch.nn.functional.pad(param2phase(self.M), (window_expand, window_expand, window_expand, window_expand), "constant", 0))
+
+        # 对右旋圆偏振光（RCP）进行调制
+        term1_RCP = -1j * X_RCP * torch.sin(g) * torch.exp(1j * torch.nn.functional.pad(param2phase(self.M), (window_expand, window_expand, window_expand, window_expand), "constant", 0))
+        term2_RCP = X_RCP * torch.cos(g)
+
+        # 将所有左旋光项叠加
+        term_LCP = term1_LCP + term1_RCP
+        term_RCP = term2_LCP + term2_RCP
+
+        return term_LCP, term_RCP
+
+class after_process(torch.nn.Module):
+    """用于获取最终输出光场的后处理。"""
+    def __init__(self):
+        super(after_process, self).__init__()
+
+    def forward(self, X):
+        X = X.abs().square()
+        return X
+
+# 探测层
+
+region_size = 15
+# 探测层（圆环布置）
+class Detector(nn.Module):
+    def __init__(self, num_classes=10, region_size=10, radius=None, start_angle_deg=0.0):
+        super(Detector, self).__init__()
+        self.num_classes = num_classes
+        self.region_size = region_size
+        self.radius = radius
+        self.start_angle = np.deg2rad(start_angle_deg)
+
+    def _gen_coords(self, H, W, device):
+        cy, cx = H // 2, W // 2
+        r = self.radius
+        if r is None:
+            r = min(H, W) // 2 - self.region_size - 5
+            r = max(r, self.region_size)
+
+        coords = []
+        for k in range(self.num_classes):
+            angle = self.start_angle + 2 * np.pi * k / self.num_classes
+            y_c = cy + int(round(r * np.sin(angle)))
+            x_c = cx + int(round(r * np.cos(angle)))
+            y0 = int(y_c - self.region_size // 2)
+            x0 = int(x_c - self.region_size // 2)
+            y0 = max(0, min(y0, H - self.region_size))
+            x0 = max(0, min(x0, W - self.region_size))
+            coords.append((y0, x0, self.region_size, self.region_size))
+        return coords
+
+    def get_region_masks(self, H, W, device):
+        """
+        返回:
+        masks: [num_classes, 1, H, W]
+        """
+        coords = self._gen_coords(H, W, device)
+        masks = []
+        for (y0, x0, h, w) in coords:
+            mask = torch.zeros(1, H, W, device=device)
+            mask[:, y0:y0+h, x0:x0+w] = 1.0
+            masks.append(mask)
+        masks = torch.stack(masks, dim=0)   # [C,1,H,W]
+        return masks
+
+    def get_all_regions_mask(self, H, W, device):
+        region_masks = self.get_region_masks(H, W, device)   # [C,1,H,W]
+        all_mask = torch.clamp(region_masks.sum(dim=0, keepdim=False), 0, 1)  # [1,H,W]
+        return all_mask
+
+    def forward(self, x):
+        assert x.dim() == 4 and x.size(1) == 1, f"Detector expects [B,1,H,W], got {list(x.shape)}"
+        B, _, H, W = x.shape
+        coords = self._gen_coords(H, W, x.device)
+
+        regions = []
+        for (y, x0, h, w) in coords:
+            region = x[:, :, y:y+h, x0:x0+w]
+            avg_intensity = region.mean(dim=(2, 3)).squeeze(1)
+            regions.append(avg_intensity.unsqueeze(1))
+
+        out = torch.cat(regions, dim=1)
+        return out
+
+class Softmax(torch.nn.Module):
+    """用于对探测器输出进行Softmax归一化"""
+    def __init__(self):
+        super(Softmax, self).__init__()
+
+    def forward(self, x):
+
+        return torch.nn.functional.softmax(x, dim=-1)
+
+# 光学神经网络模型
+class D2NN(torch.nn.Module):
+    def __init__(self, distance):
+        super(D2NN, self).__init__()
+        self.pre_process = pre_process()
+        self.transin1 = DiffractionTransmission1(0.05)#空气传播3cm
+        self.transin2 = DiffractionTransmission(0.001)#玻璃传播500微米
+        self.modulate1 = modulate_a()
+        self.transin3 = DiffractionTransmission(0.002)#层间距1毫米
+        self.modulate2 = modulate_b()
+        self.transin4 = DiffractionTransmission(0.002)#玻璃传播1毫米
+        self.modulate3 = modulate_b()
+        self.transin5 = DiffractionTransmission(0.001)#介质传播500微米
+        self.transin6 = DiffractionTransmission1(0.05)#空气传播3cm
+        self.after_process = after_process()
+        self.detector = Detector(num_classes=10, region_size=10, radius=80, start_angle_deg=90.0)
+
+    def forward(self, X):
+        X = self.pre_process(X)
+        X = self.transin1(X)
+
+        # 模拟右旋偏振光 (RCP) 和左旋偏振光 (LCP) 独立传播
+        X = self.transin2(X)
+        X_LCP, X_RCP = self.modulate1(X, 'LCP')
+        X_LCP = self.transin3(X_LCP)
+        X_RCP = self.transin3(X_RCP)
+
+        X_LCP, X_RCP = self.modulate2(X_LCP, X_RCP)
+        X_LCP = self.transin4(X_LCP)
+        X_RCP = self.transin4(X_RCP)
+        
+        X_LCP, X_RCP = self.modulate3(X_LCP, X_RCP)
+        
+        X_LCP = self.transin5(X_LCP)
+        X_RCP = self.transin5(X_RCP)
+        
+        X_LCP = self.transin6(X_LCP)
+        X_RCP = self.transin6(X_RCP)
+
+        intensity_a = self.after_process(X_LCP)
+        intensity_b = self.after_process(X_RCP)
+
+        
+        detection_a = self.detector(intensity_a)
+        detection_b = self.detector(intensity_b)
+        
+        diff = (detection_a - detection_b) / (detection_a + detection_b + 1e-8)
+        # diff = diff / 0.1
+        
+
+        
+        return diff, intensity_a, intensity_b, detection_a, detection_b  # 返回合成的强度和图像
+
+# 创建模型并传到GPU
+integrated_model = D2NN(distance).to(device)
+
+def splitting_ratio_loss(intensity_a, intensity_b, detector, label_onehot):
+    """
+    鼓励正负两个通道都把能量集中到目标探测子区域内，
+    同时压低目标子区域外的背景能量。
+
+    intensity_a, intensity_b: [B,1,H,W]
+    label_onehot: [B,C]
+    """
+    B, _, H, W = intensity_a.shape
+    device = intensity_a.device
+    eps = 1e-8
+
+    # [C,1,H,W]
+    region_masks = detector.get_region_masks(H, W, device)
+    # [1,H,W]
+    all_regions_mask = detector.get_all_regions_mask(H, W, device)
+
+    # [B,C,1,H,W]
+    region_masks_b = region_masks.unsqueeze(0).repeat(B, 1, 1, 1, 1)
+    # [B,1,H,W] 目标类别对应子区域
+    target_mask = torch.sum(label_onehot[:, :, None, None, None] * region_masks_b, dim=1)
+
+    # [B,1,H,W] 非目标区域 = 全图 - 目标区
+    outside_target_mask = 1.0 - target_mask
+
+    # ---------------------------
+    # 1. 正通道：目标区内能量占比越大越好
+    # ---------------------------
+    eta_a = (intensity_a * target_mask).sum(dim=(1, 2, 3)) / (intensity_a.sum(dim=(1, 2, 3)) + eps)
+
+    # ---------------------------
+    # 2. 负通道：目标区内能量占比也越大越好
+    # ---------------------------
+    eta_b = (intensity_b * target_mask).sum(dim=(1, 2, 3)) / (intensity_b.sum(dim=(1, 2, 3)) + eps)
+
+    # ---------------------------
+    # 3. 子区域外背景占比越小越好
+    # ---------------------------
+    bg_a = (intensity_a * outside_target_mask).sum(dim=(1, 2, 3)) / (intensity_a.sum(dim=(1, 2, 3)) + eps)
+    bg_b = (intensity_b * outside_target_mask).sum(dim=(1, 2, 3)) / (intensity_b.sum(dim=(1, 2, 3)) + eps)
+
+    # ---------------------------
+    # 4. 所有探测子区域外的全局背景也压低
+    # ---------------------------
+    bg_mask = 1.0 - all_regions_mask.unsqueeze(0)   # [B,1,H,W]
+    eta_bg = ((intensity_a + intensity_b) * bg_mask).sum(dim=(1, 2, 3)) / (
+        (intensity_a + intensity_b).sum(dim=(1, 2, 3)) + eps
+    )
+
+    # ---------------------------
+    # 5. 总损失
+    # 鼓励 a、b 都进入目标区域，同时压低目标区外背景和全局背景
+    # ---------------------------
+    loss = (1.0 - eta_a) + (1.0 - eta_b) + 0.5 * (bg_a + bg_b) + 0.5 * eta_bg
+
+    return loss.mean()
+
+
+
+
+
+
+def cross_entropy_one_hot(input, target):
+    log_probs = torch.nn.functional.log_softmax(input, dim = 1)
+    loss = -torch.sum(target * log_probs) / input.size(0)
+    return loss
+
+def detector_confinement_loss(intensity_a, intensity_b, detector):
+    """
+    约束正负两个探测面的总能量尽可能集中在所有探测子区域内部，
+    并且要求子区域内总能量显著大于子区域外背景能量。
+
+    intensity_a, intensity_b: [B,1,H,W]
+    """
+    B, _, H, W = intensity_a.shape
+    device = intensity_a.device
+    eps = 1e-8
+
+    # 所有探测子区域总mask: [1,H,W]
+    all_regions_mask = detector.get_all_regions_mask(H, W, device)   # [1,H,W]
+    all_regions_mask = all_regions_mask.unsqueeze(0)                  # [B,1,H,W]
+    bg_mask = 1.0 - all_regions_mask                                 # [B,1,H,W]
+
+    # 正通道：区域内 / 区域外
+    region_energy_a = (intensity_a * all_regions_mask).sum(dim=(1, 2, 3))
+    bg_energy_a     = (intensity_a * bg_mask).sum(dim=(1, 2, 3))
+
+    # 负通道：区域内 / 区域外
+    region_energy_b = (intensity_b * all_regions_mask).sum(dim=(1, 2, 3))
+    bg_energy_b     = (intensity_b * bg_mask).sum(dim=(1, 2, 3))
+
+    # 比值型损失：希望 region >> background
+    loss_a = -torch.log(region_energy_a / (bg_energy_a + eps) + eps)
+    loss_b = -torch.log(region_energy_b / (bg_energy_b + eps) + eps)
+
+    # 再补一个背景占比项，使背景进一步压低
+    total_energy_a = intensity_a.sum(dim=(1, 2, 3))
+    total_energy_b = intensity_b.sum(dim=(1, 2, 3))
+
+    bg_ratio_a = bg_energy_a / (total_energy_a + eps)
+    bg_ratio_b = bg_energy_b / (total_energy_b + eps)
+
+    loss_bg = bg_ratio_a + bg_ratio_b
+
+    loss = loss_a + loss_b + 0.5 * loss_bg
+    return loss.mean()
+
+#%%
+def valid_main(integrated_model, test_dataloader):
+
+      size1 = len(test_dataloader.dataset)
+
+      # 测试模型
+      all_labels = []
+      all_preds = []
+
+      integrated_model.eval()  # 设置为评估模式
+
+      with torch.no_grad():
+
+            epoch_loss = 0
+            for index, (img_tensor, label_tensor) in enumerate(test_dataloader):
+                  X = img_tensor.float().to('cuda')
+                  label = label_tensor.float().to('cuda')
+                  
+                  pred, Output_a, Output_b, Score_a, Score_b = integrated_model(X)
+                  
+                  # 取预测的类别
+                  preds = torch.argmax(pred, dim=1).cpu().numpy()
+                  true_labels = torch.argmax(label, dim=1).cpu().numpy()
+                  
+                  all_labels.extend(true_labels)
+                  all_preds.extend(preds)
+                  
+                  loss = cross_entropy_one_hot(pred, label)  
+                  epoch_loss += loss.item() * X.size(0)
+            valid_loss = epoch_loss / size1
+
+      # 计算准确率
+      accuracy = accuracy_score(all_labels, all_preds)
+
+      return accuracy, valid_loss
+  
+    
+# %% 训练
+size2 = len(dataloader.dataset)
+
+optimizer = torch.optim.Adam(integrated_model.parameters(), lr=0.05)
+scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+
+num_epochs = 80
+
+accuracys_train = []
+train_losses = []
+valid_losses = []
+accuracys_valid = []
+
+for epoch in range(num_epochs):
+    print(f"Epoch {epoch+1}\n-------------------------------")
+
+    integrated_model.train()
+
+    all_labels = []
+    all_preds = []
+    epoch_loss = 0.0
+
+    for batch, (img_tensor, label_tensor) in enumerate(dataloader):
+        X = img_tensor.float().to(device)
+        label = label_tensor.float().to(device)
+
+        pred, Output_a, Output_b, Score_a, Score_b = integrated_model(X)
+
+        detection_output = torch.argmax(pred, dim=1).cpu().numpy()
+        true_labels = torch.argmax(label, dim=1).cpu().numpy()
+
+        all_labels.extend(true_labels)
+        all_preds.extend(detection_output)
+
+        loss_ce = cross_entropy_one_hot(pred, label)
+
+       
+
+        
+        loss_split = splitting_ratio_loss( Output_a, Output_b, integrated_model.detector, label)
+        
+        loss_confine = detector_confinement_loss( Output_a, Output_b, integrated_model.detector)
+
+        loss = loss_ce 
+        
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item() * X.size(0)
+
+    epoch_loss = epoch_loss / size2
+
+    accuracy_trains = accuracy_score(all_labels, all_preds)
+    accuracys_train.append(accuracy_trains)
+    train_losses.append(epoch_loss)
+
+    integrated_model.eval()
+    accuracy_valid, valid_loss = valid_main(integrated_model, test_dataloader)
+
+    accuracys_valid.append(accuracy_valid)
+    valid_losses.append(valid_loss)
+
+    scheduler.step()
+
+    print(f"Epoch {epoch + 1}/{num_epochs} | Train acc: {accuracy_trains:.4f} | Valid acc: {accuracy_valid:.4f} | Train loss: {epoch_loss:.4f} | Valid loss: {valid_loss:.4f}")
+    
+#%%保存并显示损失函数曲线  
+font_times_new_roman = {'family': 'Times New Roman', 'size':25}
+plt.rcParams.update({'font.size': 20, 'font.family': 'Times New Roman'})  # 设置全局字体大小和字体
+#保存数据
+folder_path = r'D:\gongwei\Polarization'
+file_name1 = 'accuracy.txt'
+file_path1 = os.path.join(folder_path, file_name1)
+with open(file_path1, 'w') as f:
+    for epoch, accuracy in enumerate(accuracys_valid, start = 1):
+        f.write(f'{accuracy:.3f}\n')
+file_name2 = 'loss.txt'
+file_path2 = os.path.join(folder_path, file_name2)        
+with open(file_path2, 'w') as f:
+    for epoch, loss in enumerate(train_losses, start = 1):
+        f.write(f'{loss:.3f}\n')
+        
+fig, ax = plt.subplots(1, 2, figsize = (8, 4))
+
+        #plt.plot(accuracys_train, label='Train Accuracy')
+        
+        # 绘制分类准确率曲线
+
+ax[0].plot(accuracys_train, label='Train Accuracy', color = '#009990', linewidth = 4)
+ax[0].plot(accuracys_valid, label='Valid Accuracy', color = '#D91656', linewidth = 4)
+ax[0].spines['top'].set_linewidth(2)
+ax[0].spines['right'].set_linewidth(2)
+ax[0].spines['left'].set_linewidth(2)
+ax[0].spines['bottom'].set_linewidth(2)
+ax[0].set_xlabel('Epoch', fontdict = font_times_new_roman)
+ax[0].set_ylabel('Accuracy', fontdict = font_times_new_roman)
+ax[0].set_title('Accuracy Curve', fontdict = font_times_new_roman)
+#ax[0].set_xticklabels(np.arange(0,51, 10), fontsize = 30, fontweight = 'bold')
+ax[0].legend()
+
+
+
+
+ax[1].plot(train_losses, label='Train_losses', color = '#009990', linewidth = 4)
+ax[1].plot(valid_losses, label='Valid_losses', color = '#D91656', linewidth = 4)
+ax[1].spines['top'].set_linewidth(2)
+ax[1].spines['right'].set_linewidth(2)
+ax[1].spines['left'].set_linewidth(2)
+ax[1].spines['bottom'].set_linewidth(2)
+ax[1].set_xlabel('Epoch', fontdict = font_times_new_roman)
+ax[1].set_ylabel('Loss_Value', fontdict = font_times_new_roman)
+ax[1].set_title('Loss_Curve', fontdict = font_times_new_roman)
+#ax[1].set_xticklabels(np.arange(0,51, 10), fontsize = 30, fontweight = 'bold')
+ax[1].legend()
+plt.show()   
+
+
+# %% 测试模型
+font_times_new_roman = {'family': 'Times New Roman', 'weight' :'bold', 'size':25}
+plt.rcParams.update({'font.size': 20, 'font.family': 'Times New Roman'})  # 设置全局字体大小和字体
+
+
+
+regions = [
+    (110, 110, region_size, region_size),
+    (110, 150, region_size, region_size),
+    (110, 190, region_size, region_size),
+
+    (150, 100, region_size, region_size),
+    (150, 130, region_size, region_size),
+    (150, 170, region_size, region_size),
+    (150, 200, region_size, region_size),
+
+    (190, 110, region_size, region_size),
+    (190, 150, region_size, region_size),
+    (190, 190, region_size, region_size)
+    ]
+
+def evaluate(model, test_dataloader, loss_fn):
+    model.eval()  # 切换到评估模式
+    correct = 0
+    total = 0
+    test_loss = 0
+    with torch.no_grad():  # 不计算梯度
+        for img_tensor, label_tensor in test_dataloader:
+            X = img_tensor.float().cuda()
+            labels = torch.argmax(label_tensor, dim=1).cuda()# 返回一个张量最大值的（索引）位置
+
+            # 前向传播
+            diff, Output_a, Output_b, Score_a, Score_b = model(X)
+            
+# =============================================================================
+#             # 计算损失
+#             #loss = loss_fn(diff, labels)
+#             #test_loss += loss.item()
+#             
+#             # 计算预测
+#             _, predicted = torch.max(diff, 1)
+#             total += labels.size(0)
+#             correct += (predicted == labels).sum().item()
+# =============================================================================
+            for i in range(1,5):
+                    #vutils.save_image(pred_value[i], f'D:/FuTong_file/single_img/output1/img_{i}.png', normalize =True)
+                    #vutils.save_image(label[i], f'D:/FuTong_file/single_img/output1/img_{i}.png', normalize =True)
+                    
+                fig, ax = plt.subplots(1, 3, figsize = (8, 4))
+                    
+                ax[0].imshow(X[i].cpu().detach().squeeze(0).numpy(), cmap = 'jet')
+                ax[0].set_title('Input_object', fontdict = font_times_new_roman)
+                ax[0].axis('off')
+                    
+                ax[1].imshow(Output_a[i].cpu().detach().squeeze(0).numpy(), cmap = 'gray')
+                ax[1].set_title('positive_detector', fontdict = font_times_new_roman)
+                ax[1].axis('off')
+                for (y, x, h, w) in regions:
+                    rect = patches.Rectangle((x, y), w, h, linewidth = 0.5, edgecolor = 'r', facecolor = 'none')
+                    ax[1].add_patch(rect)
+                    #fig.colorbar(temp,ax=ax[0])
+                    
+                ax[2].imshow(Output_b[i].cpu().detach().squeeze(0).numpy(), cmap = 'gray')
+                ax[2].set_title('negative_detector', fontdict = font_times_new_roman)
+                ax[2].axis('off')
+                for (y, x, h, w) in regions:
+                    rect = patches.Rectangle((x, y), w, h, linewidth = 0.5, edgecolor = 'g', facecolor = 'none')
+                    ax[2].add_patch(rect)    
+                
+                
+    #accuracy = 100 * correct / total
+    #average_loss = test_loss / len(dataloader)
+    #return accuracy, average_loss
+# %% 评估并打印准确率
+accuracy = evaluate(integrated_model, test_dataloader, cross_entropy_one_hot)
+#print(f"Test Accuracy: {accuracy}")
+#%%#%%显示差分分数
+font_times_new_roman = {'family': 'Times New Roman', 'weight' :'bold', 'size':30}
+plt.rcParams.update({'font.size': 30, 'font.family': 'Times New Roman'})  # 设置全局字体大小和字体
+
+
+
+regions = [
+    (110, 110, region_size, region_size),
+    (110, 150, region_size, region_size),
+    (110, 190, region_size, region_size),
+
+    (150, 100, region_size, region_size),
+    (150, 130, region_size, region_size),
+    (150, 170, region_size, region_size),
+    (150, 200, region_size, region_size),
+
+    (190, 110, region_size, region_size),
+    (190, 150, region_size, region_size),
+    (190, 190, region_size, region_size)
+    ]
+
+ # 设置全局字体大小和字体
+def Differential(model, test_dataloader, loss_fn):
+    model.eval()  # 切换到评估模式
+    correct = 0
+    total = 0
+    test_loss = 0
+    with torch.no_grad():  # 不计算梯度
+        for img_tensor, label_tensor in test_dataloader:
+            X = img_tensor.float().cuda()
+            labels = torch.argmax(label_tensor, dim=1).cuda()# 返回一个张量最大值的（索引）位置
+
+            # 前向传播
+            diff, Output_a, Output_b, Score_a, Score_b = model(X)
+            #X = X[:, :, 25:-25, 25:-25]
+            # 计算损失
+# =============================================================================
+#             #loss = loss_fn(diff, labels)
+#             test_loss += loss.item()
+#             
+#             # 计算预测
+#             _, predicted = torch.max(diff, 1)
+#             total += labels.size(0)
+#             correct += (predicted == labels).sum().item()
+# =============================================================================
+            
+            for i in range(1,5):
+                    #vutils.save_image(pred_value[i], f'D:/FuTong_file/single_img/output1/img_{i}.png', normalize =True)
+                    #vutils.save_image(label[i], f'D:/FuTong_file/single_img/output1/img_{i}.png', normalize =True)
+                    
+                # 创建一个包含两个子图的图形（上面一个，下面一个），共用X轴，中间没有间隔
+                
+                fig, ax = plt.subplots(1, 3, figsize = (8, 4))
+                    
+                ax[0].imshow(X[i].cpu().detach().numpy().transpose(1, 2, 0), cmap = 'gray')
+                ax[0].set_title('Input_object', fontdict = font_times_new_roman)
+                ax[0].axis('off')
+                    
+                ax[1].imshow(Output_a[i].cpu().detach().numpy().transpose(1, 2, 0), cmap = 'gray')
+                ax[1].set_title('positive_detector', fontdict = font_times_new_roman)
+                ax[1].axis('off')
+# =============================================================================
+#                 for (y, x, h, w) in regions:
+#                     rect = patches.Rectangle((x, y), w, h, linewidth = 1, edgecolor = 'r', facecolor = 'none')
+#                     ax[1].add_patch(rect)
+# =============================================================================
+                    #fig.colorbar(temp,ax=ax[0])
+                    
+                ax[2].imshow(Output_b[i].cpu().detach().numpy().transpose(1, 2, 0), cmap = 'gray')
+                ax[2].set_title('negative_detector', fontdict = font_times_new_roman)
+                ax[2].axis('off')
+# =============================================================================
+#                 for (y, x, h, w) in regions:
+#                     rect = patches.Rectangle((x, y), w, h, linewidth = 1, edgecolor = 'g', facecolor = 'none')
+#                     ax[2].add_patch(rect)    
+# =============================================================================
+                    
+                fig, ax = plt.subplots(2, 1, figsize=(10, 12), sharex=True, gridspec_kw={'hspace': 0})
+
+                # 上面的图：正负信号（Score_a 和 Score_b）
+                # 设置条形图的宽度比例，使它们加起来等于差分信号的宽度
+                width = 0.3  # 单个条形图的宽度
+                total_width = 0.6  # 正负信号的总宽度，设置为差分信号的宽度
+
+                # 绘制正信号（Score_a）为绿色，负信号（Score_b）为红色，并排放置
+                ax[0].bar(range(len(Score_a[i].cpu().detach().numpy())), 
+                          Score_a[i].cpu().detach().numpy(), 
+                          color='#ef4231', edgecolor='black', width=width, label='Positive Signal (Score_a)', align='edge')
+
+                # 绘制负信号（Score_b）为红色，紧接着正信号
+                ax[0].bar([x - width for x in range(len(Score_b[i].cpu().detach().numpy()))], 
+                          Score_b[i].cpu().detach().numpy(),  # 负信号绘制为红色，位于正半轴
+                          color='#0a9a67', edgecolor='black', width=width, label='Negative Signal (Score_b)', align='edge')
+
+                # 在上面图的中间添加一条横线
+                ax[0].axhline(0, color='black', linestyle='-', linewidth=1)  # 在y=0位置绘制一条横线
+
+                ax[0].set_ylabel('Signal Value')
+                ax[0].legend()
+
+                # 下面的图：差分信号
+                ax[1].bar(range(len(diff[i].cpu().detach().numpy())), 
+                          diff[i].cpu().detach().numpy(), 
+                          color='#595959', edgecolor='black', label='Differential Signal', alpha=0.7, width=total_width)
+
+                # 在下图中也添加横线
+                ax[1].axhline(0, color='black', linestyle='-', linewidth=2)  # 在y=0位置绘制一条横线
+
+                ax[1].set_xlabel('class_number')
+                ax[1].set_ylabel('score_value')
+                ax[1].legend()
+
+                # 显示X轴的横线，并设置宽度
+                ax[1].spines['bottom'].set_visible(True)  # 显示底部边框（X轴横线）
+                ax[1].spines['bottom'].set_linewidth(2)  # 设置 X 轴横线的粗细
+                #ax[0].set_facecolor((0, 1, 0, 0.01))
+                #ax[1].set_facecolor((1, 0, 0, 0.01)) #填充颜色
+                # 设置四个边框的粗细
+                for spine in ax[0].spines.values():
+                    spine.set_linewidth(2)  # 调整上图的边框粗细
+
+                for spine in ax[1].spines.values():
+                    spine.set_linewidth(2)  # 调整下图的边框粗细
+
+                # 自动调整子图间距
+                plt.subplots_adjust(hspace=0)  # 设置两个子图之间的垂直间距为0
+
+                # 显示图形
+                plt.show()
+                
+# =============================================================================
+#     accuracy = 100 * correct / total
+#     #average_loss = test_loss / len(dataloader)
+#     return accuracy
+# =============================================================================
+
+# %% 运行
+accuracy = Differential(integrated_model, test_dataloader, cross_entropy_one_hot)
+#print(f"Test Accuracy: {accuracy:.2f}%")
+
+
+
+#%%# 测试模型/混淆矩阵
+def test_main(integrated_model, dataloader_test):
+    
+    all_labels = []
+    all_preds = []
+    #total=len(test_dataloader)
+    integrated_model.eval()  # 设置为评估模式
+
+    with torch.no_grad():
+        for index, (img_tensor, label_tensor) in enumerate(test_dataloader):
+            img = img_tensor.float().to('cuda')
+            label = label_tensor.float().to('cuda')
+            
+            pred, Output_a, Output_b, Score_a, Score_b  = integrated_model(img)
+            
+            # 取预测的类别
+            preds = torch.argmax(pred, dim=1).cpu().numpy()
+            true_labels = torch.argmax(label, dim=1).cpu().numpy()
+            
+            all_labels.extend(true_labels)
+            all_preds.extend(preds)
+
+    # 计算准确率
+    accuracy = accuracy_score(all_labels, all_preds)
+    print(f"Accuracy: {accuracy:.4f}")
+
+    # 计算混淆矩阵
+    conf_matrix = confusion_matrix(all_labels, all_preds)
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(conf_matrix, annot=True, cmap='Reds', fmt='g')#  Accent，Blues， Greens Reds
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title('Confusion Matrix')
+    plt.show()
+
+    return pred
+pred = test_main(integrated_model, test_dataloader)
+
+
+#%%显示调制层
+# %% 显示并保存相位调制层参数
+def show_phase_modulators(model, out_dir=r"D:/gongwei/modulate"):
+    """
+    提取模型中的 modulate1/2/3 层参数 M
+    - 保存为 .txt 和 .bmp
+    - 显示图像
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    modulators = [model.modulate1.M, model.modulate2.M, model.modulate3.M]
+
+    phases = []
+    for i, M in enumerate(modulators, start=1):
+        # 将 M 转换为相位 (0~π)
+        phase = (torch.sigmoid(M.detach()) * 2 * np.pi).cpu().numpy()
+        phases.append(phase)
+
+        # 保存 txt
+        np.savetxt(os.path.join(out_dir, f"phase{i}.txt"), phase, fmt="%.8f")
+
+        # 映射到 0~255 保存 bmp
+        img = (phase / (2 * np.pi) * 255).clip(0, 255).astype(np.uint8)
+        Image.fromarray(img).save(os.path.join(out_dir, f"tensors{i}.bmp"))
+
+    # 可视化显示
+    fig, axes = plt.subplots(1, len(phases), figsize=(12, 5))
+    for i, (ax, phase) in enumerate(zip(axes, phases), start=1):
+        ax.imshow((phase / (2 * np.pi) * 255).astype(np.uint8), cmap='inferno')
+        ax.set_title(f'Modulate_layer_{i}')
+        ax.axis('off')
+    plt.show()
+#%%
+show_phase_modulators(integrated_model)
+
+#%%能量百分比统计
+
+#%%
+end_time = datetime.now()
+print(f"Training Time: {end_time - start_time}")
+#保存模型
+

@@ -1,0 +1,40 @@
+{
+  "aligned_devices": [
+    {
+      "group": "02_Encoder",
+      "aligned_beams": [
+        "Incident / reflected path 1",
+        "Incident / reflected path 2"
+      ]
+    },
+    {
+      "group": "03_SLM_A",
+      "aligned_beams": [
+        "Incident / reflected path 2",
+        "Incident / reflected path 3"
+      ]
+    },
+    {
+      "group": "04_SLM_B",
+      "aligned_beams": [
+        "Incident / reflected path 3",
+        "Incident / reflected path 4"
+      ]
+    },
+    {
+      "group": "05_SLM_C",
+      "aligned_beams": [
+        "Incident / reflected path 4",
+        "Incident / reflected path 5"
+      ]
+    }
+  ],
+  "orbit_checked_frames": [
+    1,
+    49,
+    97,
+    145
+  ],
+  "rotation_degrees": 360,
+  "physical_reconstruction": false
+}
